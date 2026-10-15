@@ -40,3 +40,16 @@ resource "aws_rds_cluster_instance" "this" {
   auto_minor_version_upgrade = true
   tags                       = local.app_tags
 }
+
+# Allow PostgreSQL traffic from inside the VPC (EKS nodes run the data jobs).
+# Without this, pods on the EKS-managed node security group time out connecting to Aurora.
+resource "aws_security_group_rule" "postgres_from_vpc" {
+  count             = data.aws_caller_identity.this.id != "000000000000" && var.aws_postgres_enabled ? 1 : 0
+  type              = "ingress"
+  description       = "PostgreSQL from inside the VPC (EKS data jobs)"
+  protocol          = "tcp"
+  from_port         = 5432
+  to_port           = 5432
+  cidr_blocks       = [data.aws_vpc.this.cidr_block]
+  security_group_id = data.aws_security_groups.this.ids[0]
+}
