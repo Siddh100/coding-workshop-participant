@@ -7,6 +7,7 @@ Tests for the ACME Talent ETL job (data/talent-etl/job.py).
 
 Run:  python3 -m pytest data/talent-etl/tests -v
 """
+import io
 import json
 import os
 import sys
@@ -336,3 +337,52 @@ def test_retry_with_backoff(monkeypatch):
         return "ok"
 
     assert flaky() == "ok" and calls["n"] == 3
+
+
+# ======================================================================
+# PART 4 - CLOUD PATH: READ AURORA TABLES THROUGH THE BACKEND API
+# ======================================================================
+
+class _FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def test_api_reader_sends_key_and_parses_csv(monkeypatch):
+    import hashlib
+    seen = {}
+
+    def fake_urlopen(request, timeout):
+        seen["url"], seen["key"] = request.full_url, request.get_header("X-api-key")
+        return _FakeResponse(b'team_id,name,department\n1,"Team A, North",Sales\n')
+
+    monkeypatch.setattr(job.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("POSTGRES_API_URL", "https://example.cloudfront.net/api/talent-source/")
+    monkeypatch.setenv("POSTGRES_PASS", "pw")
+    df = job.read_postgres_via_api(job.Config.from_env(), "teams")
+    assert seen["url"] == "https://example.cloudfront.net/api/talent-source?table=teams"
+    assert seen["key"] == hashlib.sha256(b"pw").hexdigest()
+    assert df.loc[0, "name"] == "Team A, North" and df.loc[0, "team_id"] == "1"
+
+
+def test_api_reader_requires_https(monkeypatch):
+    monkeypatch.setenv("POSTGRES_API_URL", "http://insecure.example/api")
+    with pytest.raises(ValueError):
+        job.read_postgres_via_api(job.Config.from_env(), "teams")
+
+
+def test_full_run_through_api_reader(ctx, monkeypatch):
+    """The whole pipeline works when the source tables arrive through the backend API."""
+    def fake_urlopen(request, timeout):
+        table = request.full_url.split("table=")[1]
+        return _FakeResponse((DATASET_DIR / f"{table}.csv").read_bytes())
+
+    monkeypatch.setattr(job.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("POSTGRES_API_URL", "https://example.cloudfront.net/api/talent-source")
+    cfg = job.Config.from_env()
+    api_ctx = job.RunContext(cfg=cfg, lake=ctx.lake, pg_reader=job.read_postgres_via_api)
+    assert job.run(api_ctx) == 0
+    assert api_ctx.metric("silver", "employees")["valid"] == 2000

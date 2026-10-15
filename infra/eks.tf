@@ -90,6 +90,7 @@ resource "null_resource" "helm_python_job" {
         --set-string pythonJob.env.POSTGRES_PASS=${local.env_vars.POSTGRES_PASS} \
         --set-string pythonJob.env.DATALAKE_BUCKET=${aws_s3_bucket.datalake.bucket} \
         --set-string pythonJob.env.AWS_DEFAULT_REGION=${data.aws_region.this.region} \
+        --set-string pythonJob.env.POSTGRES_API_URL=https://${one(aws_cloudfront_distribution.this.*.domain_name)}/api/talent-source \
         --set-string pythonJob.env.AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
         --set-string pythonJob.env.AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
         --set-string pythonJob.env.AWS_SESSION_TOKEN="$AWS_SESSION_TOKEN" \

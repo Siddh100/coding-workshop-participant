@@ -19,12 +19,15 @@ locally (LocalStack + local PostgreSQL) and in the cloud (EKS + Aurora + S3).
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -64,6 +67,7 @@ class Config:
     pg_name: str
     pg_user: str
     pg_pass: str
+    pg_api_url: str
     bucket: str
     landing_prefix: str
     ingest_date: str
@@ -80,6 +84,7 @@ class Config:
             pg_name=os.getenv("POSTGRES_NAME", "postgres"),
             pg_user=os.getenv("POSTGRES_USER", "postgres"),
             pg_pass=os.getenv("POSTGRES_PASS", ""),
+            pg_api_url=os.getenv("POSTGRES_API_URL", "").rstrip("/"),
             bucket=os.getenv("DATALAKE_BUCKET", "acme-datalake"),
             landing_prefix=os.getenv("LANDING_PREFIX", "landing/learning_activity").strip("/"),
             ingest_date=os.getenv("INGEST_DATE", date.today().isoformat()),
@@ -110,7 +115,7 @@ def with_retry(func: Callable) -> Callable:
         for attempt in range(1, attempts + 1):
             try:
                 return func(*args, **kwargs)
-            except (ClientError, psycopg.OperationalError, ConnectionError, TimeoutError) as exc:
+            except (ClientError, psycopg.OperationalError, urllib.error.URLError, ConnectionError, TimeoutError) as exc:
                 if attempt == attempts:
                     log.error("%s failed after %d attempts: %s", func.__name__, attempts, exc)
                     raise
@@ -210,6 +215,25 @@ def read_postgres_table(cfg: Config, table: str) -> pd.DataFrame:
         rows = cur.fetchall()
     df = pd.DataFrame(rows, columns=columns)
     return df.astype(object).where(df.notna(), None).astype(str).replace("None", "")
+
+
+@with_retry
+def read_postgres_via_api(cfg: Config, table: str) -> pd.DataFrame:
+    """
+    Read a full PostgreSQL table through the talent-source backend service (cloud path).
+
+    In the workshop VPC only resources in Aurora's security group (the backend Lambdas) can
+    reach Aurora, so the EKS job asks backend/talent-source for the table as CSV.
+    Auth header = sha256(POSTGRES_PASS), which both sides already receive.
+    """
+    url = f"{cfg.pg_api_url}?table={table}"
+    if not url.startswith("https://"):
+        raise ValueError(f"POSTGRES_API_URL must be https: {cfg.pg_api_url}")
+    key = hashlib.sha256(cfg.pg_pass.encode()).hexdigest()
+    request = urllib.request.Request(url, headers={"X-Api-Key": key})
+    with urllib.request.urlopen(request, timeout=180) as response:  # nosec B310 - https enforced above
+        body = response.read()
+    return pd.read_csv(io.BytesIO(body), dtype=str, keep_default_na=False)
 
 
 # =============================================================================
@@ -726,7 +750,9 @@ def run(ctx: RunContext) -> int:
 def main() -> None:
     """Entry point (same name as the workshop skeleton)."""
     cfg = Config.from_env()
-    sys.exit(run(RunContext(cfg=cfg, lake=DataLake(cfg.bucket))))
+    reader = read_postgres_via_api if cfg.pg_api_url else read_postgres_table
+    log.info("PostgreSQL source: %s", f"backend API {cfg.pg_api_url}" if cfg.pg_api_url else f"direct {cfg.pg_host}")
+    sys.exit(run(RunContext(cfg=cfg, lake=DataLake(cfg.bucket), pg_reader=reader)))
 
 
 if __name__ == "__main__":
