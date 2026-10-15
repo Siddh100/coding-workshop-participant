@@ -1,0 +1,5 @@
+pandas>=2.2
+pyarrow>=17
+boto3>=1.34
+psycopg[binary]>=3.2
+pydantic>=2.7
