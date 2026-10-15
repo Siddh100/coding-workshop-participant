@@ -6,6 +6,8 @@ pythonJob:
   backoffLimit: 4
   ttlSecondsAfterFinished: 100
   restartPolicy: Never
+  # Environment variables passed to the job container (set by infra/eks.tf)
+  env: {}
   image:
     repository: jupyter/all-spark-notebook
     pullPolicy: IfNotPresent

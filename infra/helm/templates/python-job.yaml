@@ -29,6 +29,13 @@ spec:
         - name: {{ include "name" . }}-{{ .Values.pythonJob.name }}
           image: {{ .Values.pythonJob.image.repository }}:{{ .Values.pythonJob.image.tag }}
           imagePullPolicy: {{ .Values.pythonJob.image.pullPolicy }}
+          {{- with .Values.pythonJob.env }}
+          env:
+            {{- range $key, $value := . }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
           command: ["sh", "-c"]
           args:
             - |

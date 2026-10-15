@@ -82,6 +82,14 @@ resource "null_resource" "helm_python_job" {
         --set pythonJob.name=${replace(each.key, "_", "-")} \
         --set-file pythonJob.scriptContent=${each.value.path}/${each.value.file} \
         --set-file pythonJob.requirementsContent=${each.value.path}/${each.value.reqs} \
+        --set-string pythonJob.env.IS_LOCAL=false \
+        --set-string pythonJob.env.POSTGRES_HOST=${local.env_vars.POSTGRES_HOST} \
+        --set-string pythonJob.env.POSTGRES_PORT=${local.env_vars.POSTGRES_PORT} \
+        --set-string pythonJob.env.POSTGRES_NAME=${local.env_vars.POSTGRES_NAME} \
+        --set-string pythonJob.env.POSTGRES_USER=${local.env_vars.POSTGRES_USER} \
+        --set-string pythonJob.env.POSTGRES_PASS=${local.env_vars.POSTGRES_PASS} \
+        --set-string pythonJob.env.DATALAKE_BUCKET=${aws_s3_bucket.datalake.bucket} \
+        --set-string pythonJob.env.AWS_DEFAULT_REGION=${data.aws_region.this.region} \
         --namespace default
     EOT
   }

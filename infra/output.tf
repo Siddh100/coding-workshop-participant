@@ -45,3 +45,32 @@ output "jupyter_url" {
   description = "The URL of the JupyterHub instance"
   value       = data.aws_caller_identity.this.id == "000000000000" ? "http://localhost:8888" : try(one(aws_eks_cluster.this.*.endpoint), null)
 }
+
+output "datalake_bucket" {
+  description = "The S3 bucket used as the data lake"
+  value       = aws_s3_bucket.datalake.bucket
+}
+
+output "postgres_host" {
+  description = "PostgreSQL (Aurora) endpoint"
+  value       = local.env_vars.POSTGRES_HOST
+  sensitive   = true
+}
+
+output "postgres_name" {
+  description = "PostgreSQL database name"
+  value       = local.env_vars.POSTGRES_NAME
+  sensitive   = true
+}
+
+output "postgres_user" {
+  description = "PostgreSQL username"
+  value       = local.env_vars.POSTGRES_USER
+  sensitive   = true
+}
+
+output "postgres_pass" {
+  description = "PostgreSQL password"
+  value       = local.env_vars.POSTGRES_PASS
+  sensitive   = true
+}
