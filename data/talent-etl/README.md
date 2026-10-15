@@ -9,9 +9,10 @@ and answers 7 workforce questions in a **Jupyter notebook**.
 | `job.py` | The pipeline: `ingest_into_bronze()` → `transform_to_silver()` → `aggregate_to_gold()` (same structure as the workshop skeleton) |
 | `requirements.txt` | Runtime libraries (installed automatically in the EKS job pod) |
 | `requirements-dev.txt` | Runtime + test libraries |
-| `tests/test_talent_etl.py` | 28 unit + end-to-end tests |
+| `tests/test_talent_etl.py` | 31 unit + end-to-end tests |
 | `talent_insights.ipynb` | Business-facing notebook: answers to the 7 questions with charts |
-| `TESTING.md` | Test commands, results and conclusions |
+| `TESTING.md` | Test commands, results and conclusions (local + cloud) |
+| `../../backend/talent-source/` | Backend Lambda that loads the HR tables into **Aurora** and serves them to the cloud job (see section 8) |
 
 ---
 
@@ -86,14 +87,34 @@ python3 -m jupyter notebook data/talent-etl/talent_insights.ipynb
 
 ### Cloud (EKS + Aurora PostgreSQL + S3)
 
+Use a **fresh terminal** (no LocalStack variables), from the repo root:
+
 ```sh
+# 0. AWS login + EKS on
+./bin/setup-participant.sh && source ENVIRONMENT.config
+unset AWS_ENDPOINT_URL AWS_ENDPOINT_URL_S3
 echo "export TF_VAR_aws_eks_enabled=true" >> ~/.bashrc && source ~/.bashrc
-./bin/deploy-backend.sh                 # Terraform auto-discovers data/talent-etl and runs it as a Kubernetes Job
-kubectl get jobs
-kubectl logs -f job/<job-name>
+
+# 1. Deploy: data-lake bucket, Aurora, backend Lambdas, EKS + the talent-etl Kubernetes Job
+./bin/deploy-backend.sh
+
+# 2. S3 source: upload the learning_activity files to the cloud landing zone
+aws s3 cp --recursive ~/dataset/data-engineering-performance-talent-management/learning_activity \
+    s3://$(cd infra && terraform output -raw datalake_bucket)/landing/learning_activity/
+
+# 3. PostgreSQL source: load the 7 HR tables into Aurora through the backend service
+KEY=$(printf %s "$(cd infra && terraform output -raw postgres_pass)" | sha256sum | cut -d' ' -f1)
+API=https://$(cd infra && terraform output -raw cloudfront_distribution_url)/api/talent-source
+curl -s -X POST -H "X-Api-Key: $KEY" "$API?action=seed"     # {"seeded": {"teams": 100, ...}}
+curl -s -H "X-Api-Key: $KEY" "$API?action=health"            # row count per table
+
+# 4. Run the pipeline (re-create the job now that the sources are loaded) and watch it
+kubectl delete job coding-workshop-talent-etl --ignore-not-found
+./bin/deploy-backend.sh
+kubectl logs -f job/coding-workshop-talent-etl   # job name = <helm chart name>-<folder name>
 ```
 
-The same `job.py` runs in both modes with **no code changes**. Only environment variables differ.
+The same `job.py` runs locally and in the cloud with **no code changes**. Only environment variables differ.
 
 ### Configuration (environment variables)
 
@@ -105,6 +126,7 @@ The same `job.py` runs in both modes with **no code changes**. Only environment 
 | `AWS_ENDPOINT_URL` | *(unset = real AWS)* | Set to LocalStack URL for local runs |
 | `LANDING_PREFIX` | `landing/learning_activity` | Where the S3 source files arrive |
 | `INGEST_DATE` | today | Bronze/quarantine partition date (set it to re-run a past day) |
+| `POSTGRES_API_URL` | *(unset = connect directly)* | Cloud only: read the source tables through `backend/talent-source` instead of a direct connection (set by `infra/eks.tf`) |
 | `RETRY_ATTEMPTS` / `RETRY_BASE_DELAY` | `3` / `1.0` | Exponential backoff for S3/PostgreSQL calls (1s, 2s, 4s …) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
@@ -213,4 +235,52 @@ Result: **29,574 clean events** (29,574 valid + 143 rejected + 151 duplicates = 
 | Risk score | Transparent rule-based score, not an ML model; weights are documented and easy to tune. |
 | Trends | Only two review periods exist, so a "trend" is the change between two points. |
 | Projects | Only 33 projects over 27 teams, so Q6 correlation is indicative only. |
-| Cloud config | The provided Helm job template does not pass `POSTGRES_*` / bucket variables into the pod; see the `infra/` changes for the cloud run. |
+| Aurora access | Aurora only accepts traffic from its own security group. Backend Lambdas are in it, EKS nodes are not, and participants may not change security groups. So the job reads Aurora **through the `talent-source` backend service** (section 8). |
+| Aurora auto-pause | Aurora Serverless v2 is configured with `min_capacity = 0` and pauses when idle; the first connection waits ~15 s for it to resume. The backend uses a 60 s connect timeout plus retries. |
+| Cloud credentials | Pods get no AWS identity from the node role, so the deploy passes the participant's temporary AWS credentials as env vars. Production should use IRSA / EKS Pod Identity and a Kubernetes Secret. |
+| Backend API auth | The backend requires `X-Api-Key = sha256(POSTGRES_PASS)`. Both the Lambda and the EKS job already receive that password, so no new secret is introduced. |
+
+---
+
+## 8. Cloud deployment (AWS)
+
+### Cloud architecture
+
+```
+ S3 landing/ (783 JSONL) ─────────────────────────────────────┐
+                                                              ▼
+ Aurora PostgreSQL ◄──► backend/talent-source (Lambda) ──► EKS Job: job.py ──► S3 data lake
+   (7 HR tables)         in Aurora's security group          (talent-etl)       bronze / silver / gold
+                         GET ?table=<name> → CSV                                quarantine / _lineage
+```
+
+### Why a backend service in front of Aurora?
+
+| Finding | Evidence |
+|---|---|
+| Aurora's security group (`coding-workshop-<participant>`) allows traffic **only from itself** | `aws ec2 describe-security-groups` |
+| Backend Lambdas run in that group (`infra/lambda.tf`), EKS managed nodes do not | Connections from an EKS pod and from the VDI timed out; the repo's own `backend/python-service` example connected (`PostgreSQL 17.7`) |
+| Participants cannot add an ingress rule | `ec2:AuthorizeSecurityGroupIngress … explicit deny` |
+
+So `backend/talent-source` is the network path to Aurora, following the repo's design (backend services talk to Aurora).
+
+| Route (via CloudFront `/api/talent-source`) | Purpose |
+|---|---|
+| `POST ?action=seed` | Drop and recreate the 7 tables from `seed/schema.sql`, then load `seed/*.csv` (idempotent) |
+| `GET ?action=health` | Row count per table |
+| `GET ?table=<name>` | Whole table as CSV, used by Bronze ingestion (`read_postgres_via_api` in `job.py`) |
+
+### Infra changes (`infra/`)
+
+| File | Change | Why |
+|---|---|---|
+| `s3.tf` | Bucket `coding-workshop-datalake-<participant>` | The repo had no data-lake bucket |
+| `helm/templates/python-job.yaml`, `helm/values.yaml` | `env:` block driven by `pythonJob.env` | The provided job template passed no environment variables to the pod |
+| `eks.tf` | Passes `IS_LOCAL=false`, `POSTGRES_*`, `POSTGRES_API_URL`, `DATALAKE_BUCKET`, region and AWS credentials | Same `job.py`, cloud settings |
+| `output.tf` | `datalake_bucket`, `postgres_*` (sensitive) | Load the sources without hard-coding anything |
+
+### Result
+
+The cloud run read Aurora through the backend, wrote all layers to `s3://coding-workshop-datalake-c9ade5e5/`,
+passed **16/16 reconciliation checks** and produced the **same counts as the local run**
+(`status=SUCCESS`, 48.6 s). Log excerpt in `TESTING.md` section 4.
